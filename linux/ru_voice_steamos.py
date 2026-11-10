@@ -95,7 +95,12 @@ LAUNCHER_SCRIPT = """#!/usr/bin/env bash
 # Перед стартом проверяет обновления мода и совместимость с игрой (обычно меньше секунды),
 # затем запускает игру ровно один раз. Сбой или зависание проверки не мешают запуску игры.
 TOOL="$HOME/.local/share/voices-of-embervale-ru/ru_voice_steamos.py"
-[ -f "$TOOL" ] && timeout 900 python3 "$TOOL" launch
+if [ -f "$TOOL" ]; then
+  # Steam Runtime's PATH, LD_LIBRARY_PATH and LD_PRELOAD break host programs (python3, zenity):
+  # clear them for the check only. The game below starts with Steam's environment untouched.
+  env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH="${SYSTEM_PATH:-/usr/local/bin:/usr/bin}:/bin" \\
+    timeout 900 /usr/bin/python3 "$TOOL" launch -- "$@"
+fi
 exec "$@"
 """
 
@@ -683,23 +688,58 @@ def package_path(release: dict) -> Path:
 
 # ------------------------------------------------------------- game mode UI
 
+def host_env() -> dict:
+    """Environment for host programs started from a Steam launch: without Steam Runtime's
+    PATH, LD_LIBRARY_PATH and LD_PRELOAD (its bundled zenity and preloaded overlay break them)."""
+    env = {key: value for key, value in os.environ.items() if key not in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
+    if os.environ.get("SYSTEM_LD_LIBRARY_PATH"):
+        env["LD_LIBRARY_PATH"] = os.environ["SYSTEM_LD_LIBRARY_PATH"]
+    env["PATH"] = os.environ.get("SYSTEM_PATH") or "/usr/local/bin:/usr/bin"
+    if "/bin" not in env["PATH"].split(":"):
+        env["PATH"] += ":/bin"
+    return env
+
+
+def reaper_prefix(command: list[str]) -> list[str]:
+    """`reaper SteamLaunch AppId=N --` from the game command line. gamescope assigns a window to the
+    game (and shows it in Game Mode) by finding this reaper among the window process' ancestors."""
+    if command and command[0].endswith("/reaper") and "--" in command:
+        return command[:command.index("--") + 1]
+    return []
+
+
 class Ui:
     """zenity dialogs that close by themselves: in Game Mode a gamepad cannot press GTK buttons."""
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, game_command: list[str] | None = None):
+        self.env = host_env()
         has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
-        self.zenity = shutil.which("zenity") if enabled and has_display else None
+        self.zenity = shutil.which("zenity", path=self.env["PATH"]) if enabled and has_display else None
+        self.prefix = reaper_prefix(game_command or [])
+        self.game = None
+
+    def _run(self, args: list[str], **kwargs):
+        return subprocess.Popen(self.prefix + [self.zenity, "--title", UI_TITLE, "--width", "560"] + args,
+                                env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
+
+    def _note(self, message: str) -> None:
+        if self.game:
+            log(self.game, message)
 
     def _show(self, kind: str, text: str, timeout: int) -> None:
         say(text)
         if not self.zenity:
+            self._note(f"Dialog skipped: no zenity/display (DISPLAY={os.environ.get('DISPLAY')})")
             return
+        started = time.time()
         try:
-            subprocess.run([self.zenity, kind, "--title", UI_TITLE, "--width", "560", "--text", text,
-                            "--timeout", str(timeout)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=timeout + 15)
-        except (OSError, subprocess.SubprocessError):
-            pass
+            process = self._run([kind, "--text", text, "--timeout", str(timeout)], stdin=subprocess.DEVNULL)
+            _, errors = process.communicate(timeout=timeout + 15)
+            self._note(f"Dialog {kind} rc={process.returncode} shown {time.time() - started:.1f}s "
+                       f"DISPLAY={os.environ.get('DISPLAY')} reaper={bool(self.prefix)} "
+                       + errors.decode("utf-8", "replace")[-300:].replace(chr(10), " "))
+        except (OSError, subprocess.SubprocessError) as error:
+            self._note(f"Dialog {kind} failed: {error!r}")
 
     def info(self, text: str, timeout: int = 5) -> None:
         self._show("--info", text, timeout)
@@ -714,10 +754,8 @@ class Ui:
         process = None
         if self.zenity:
             try:
-                process = subprocess.Popen(
-                    [self.zenity, "--progress", "--title", UI_TITLE, "--width", "560", "--text", text, "--no-cancel",
-                     "--auto-close"] + (["--pulsate"] if pulsate else []),
-                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+                process = self._run(["--progress", "--text", text, "--no-cancel", "--auto-close"]
+                                    + (["--pulsate"] if pulsate else []), stdin=subprocess.PIPE, text=True)
             except OSError:
                 process = None
         shown = [-1]
@@ -973,14 +1011,17 @@ def run_checker(game: Path) -> tuple[bool, int, str]:
     try:
         result = subprocess.run([str(CHECKER), "run", "--dry-run", "-g", str(game)], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300,
-                                env=dict(os.environ, NO_COLOR="1"))
+                                env=dict(host_env(), NO_COLOR="1"))
         output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout.decode("utf-8", "replace"))
         code = result.returncode
     except (OSError, subprocess.SubprocessError) as error:
         return False, 0, str(error)
     maps = output.count("RU_VOICE_MAP ")
-    errors = [line.strip() for line in output.splitlines() if "ERROR" in line or "Error" in line]
-    return code == 0 and not errors, maps, " ".join(errors)[-600:] or output[-600:]
+    # The exit code decides (a Lua error exits 1); matching lines only explain a failure.
+    # Lines from the dynamic loader (e.g. a preloaded 32-bit Steam overlay) are not mod errors.
+    errors = [line.strip() for line in output.splitlines()
+              if ("ERROR" in line or "Error" in line) and "ld.so" not in line]
+    return code == 0, maps, " ".join(errors)[-600:] or output[-600:]
 
 
 def validate(game: Path, state: dict, ui: Ui | None = None, force: bool = False) -> dict:
@@ -1256,8 +1297,11 @@ def update_installed(game: Path, state: dict, release: dict | None) -> None:
 
 def cmd_launch(args) -> None:
     """Called by launch.sh before the game; launch.sh starts the game itself, exactly once, afterwards."""
+    command = list(args.game_command or [])
+    if command[:1] == ["--"]:
+        command = command[1:]
     try:
-        launch_prepare()
+        launch_prepare(command)
     except BaseException as error:  # never fail loudly: the game starts anyway
         with contextlib.suppress(BaseException):
             log(find_game(None)[0], f"Launch check failed: {error!r}")
@@ -1272,18 +1316,20 @@ def refresh_launcher() -> None:
         os.replace(temp, LAUNCHER)
 
 
-def launch_prepare() -> None:
+def launch_prepare(command: list[str]) -> None:
     game, _ = find_game(None)
     state = read_state(game)
     if not state or state.get("status") != "installed":
         return
-    ui = Ui()
+    ui = Ui(game_command=command)
+    ui.game = game
     release = fetch_release(timeout=5)
     updated = False
     if release:
         if os.environ.get("RU_VOICE_REEXEC") != "1" and self_update(release):
             log(game, "Installer updated itself; re-running the launch check")
-            os.execve(sys.executable, [sys.executable, str(TOOL), "launch"], dict(os.environ, RU_VOICE_REEXEC="1"))
+            os.execve(sys.executable, [sys.executable, str(TOOL), "launch", "--", *command],
+                      dict(os.environ, RU_VOICE_REEXEC="1"))
         refresh_launcher()
         if state.get("release", {}).get("revision") != release["revision"]:
             try:
