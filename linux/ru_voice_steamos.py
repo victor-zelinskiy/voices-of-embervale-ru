@@ -701,10 +701,12 @@ def host_env() -> dict:
 
 
 def reaper_prefix(command: list[str]) -> list[str]:
-    """`reaper SteamLaunch AppId=N --` from the game command line. gamescope assigns a window to the
-    game (and shows it in Game Mode) by finding this reaper among the window process' ancestors."""
-    if command and command[0].endswith("/reaper") and "--" in command:
-        return command[:command.index("--") + 1]
+    """The game command line up to `reaper SteamLaunch AppId=N --` (Steam puts steam-launch-wrapper in
+    front of it). gamescope assigns a window to the game, and shows it in Game Mode, by finding this
+    reaper among the window process' ancestors."""
+    for index, part in enumerate(command):
+        if part.endswith("/reaper") and "--" in command[index:]:
+            return command[:command.index("--", index) + 1]
     return []
 
 
@@ -736,7 +738,8 @@ class Ui:
             process = self._run([kind, "--text", text, "--timeout", str(timeout)], stdin=subprocess.DEVNULL)
             _, errors = process.communicate(timeout=timeout + 15)
             self._note(f"Dialog {kind} rc={process.returncode} shown {time.time() - started:.1f}s "
-                       f"DISPLAY={os.environ.get('DISPLAY')} reaper={bool(self.prefix)} "
+                       f"DISPLAY={os.environ.get('DISPLAY')} zenity={self.zenity} PATH={self.env['PATH']} "
+                       f"prefix={' '.join(self.prefix)[-160:]} "
                        + errors.decode("utf-8", "replace")[-300:].replace(chr(10), " "))
         except (OSError, subprocess.SubprocessError) as error:
             self._note(f"Dialog {kind} failed: {error!r}")
@@ -1343,6 +1346,10 @@ def launch_prepare(command: list[str]) -> None:
     set_enabled(game, state, result["ok"])
     log(game, f"Launch: release {state.get('release', {}).get('revision')} build {result['build']} "
               + ("enabled" if result["ok"] else "disabled: " + result["reason"]))
+    test = TOOL_HOME / "dialog-test"
+    if test.exists():
+        test.unlink()
+        ui.info("Голоса Эмбервейла: проверка окна в игровом режиме. Окно закроется само.", 5)
     if not result["ok"]:
         ui.warn(INCOMPATIBLE_TEXT.format(build=result["build"]), 12)
     elif updated:
