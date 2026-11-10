@@ -101,6 +101,9 @@ if [ -f "$TOOL" ]; then
   env -u LD_PRELOAD -u LD_LIBRARY_PATH PATH="${SYSTEM_PATH:-/usr/local/bin:/usr/bin}:/bin" \\
     timeout 900 /usr/bin/python3 "$TOOL" launch -- "$@"
 fi
+# Proton must take dbghelp.dll from the game folder (our runtime, which loads EML). Passing it here works
+# from the very first launch and survives a recreated Proton prefix; the prefix registry entry is a fallback.
+export WINEDLLOVERRIDES="dbghelp=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
 exec "$@"
 """
 
@@ -589,6 +592,8 @@ def apply_overrides(game: Path, library: Path | None, state_dir: Path) -> dict |
 
 
 def overrides_status(library: Path | None) -> tuple[bool, str]:
+    if launcher_configured() and LAUNCHER.is_file() and "dbghelp=n,b" in LAUNCHER.read_text(encoding="utf-8"):
+        return True, "launch.sh (WINEDLLOVERRIDES при каждом запуске)"
     user_reg = find_user_reg(library)
     if user_reg is not None:
         values = reg_values(user_reg)
@@ -1516,7 +1521,7 @@ def cmd_install(args) -> None:
             say("Автообновление включено: при каждом запуске игры мод сам проверяет обновления и совместимость.")
         except Fail as error:
             say(f"Автообновление не включено: {error}")
-    if state["overrides"] is None:
+    if state["overrides"] is None and not launcher_configured():
         say()
         say("ВНИМАНИЕ: префикс Proton для Enshrouded ещё не создан, поэтому DLL overrides не записаны.")
         say("Сделайте одно из двух:")

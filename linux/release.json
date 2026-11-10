@@ -1,5 +1,5 @@
 {
-  "revision": 10,
+  "revision": 11,
   "name": "0.3.3-beta+steamos",
   "maps": 1118,
   "package": {
@@ -10,7 +10,7 @@
   },
   "tool": {
     "path": "linux/ru_voice_steamos.py",
-    "sha256": "89da49fefbc26aaad9e5a7dea356b35610b0cb7ff775366ebe855bc7650c661c"
+    "sha256": "7b1e4d8e373d64c718f02d6a3abafecc05543cff1489efdb8863392d87865775"
   },
   "runtime": {
     "path": "linux/bin/dbghelp.dll",
