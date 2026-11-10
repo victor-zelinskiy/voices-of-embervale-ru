@@ -3,6 +3,7 @@
 Run after changing anything a player should receive, then commit and push to the fork:
     python linux/make_release.py            # bump revision, rehash tool/runtime/checker/overlay
     python linux/make_release.py --check    # verify the committed hashes without changing anything
+    python linux/make_release.py --bump     # new revision without file changes: players re-validate
 
 Fixes on top of the author's package go to linux/overlay/<path inside the mod folder>,
 e.g. linux/overlay/src/mod.lua replaces mods/ru_voice_separate_525/src/mod.lua.
@@ -59,6 +60,7 @@ def build(revision: int) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--bump", action="store_true")
     args = parser.parse_args()
     current = json.loads(RELEASE.read_text(encoding="utf-8")) if RELEASE.is_file() else {"revision": 0}
     if args.check:
@@ -68,7 +70,7 @@ def main() -> None:
         print(f"release.json OK (revision {current['revision']})")
         return
     unchanged = build(current["revision"])
-    if unchanged == current:
+    if unchanged == current and not args.bump:
         print(f"Nothing changed (revision {current['revision']})")
         return
     release = build(current["revision"] + 1)
