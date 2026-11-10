@@ -13,9 +13,10 @@
 # Что делает install (можно запускать повторно):
 #   1. скачивает ru_voice_steamos.py (установщик) из этого репозитория;
 #   2. скачивает полный архив мода из GitHub Releases автора (Daber-devNull) и сверяет SHA-256;
-#   3. скачивает shroudtopia.dll из этого репозитория (runtime с автовключением озвучки) и сверяет SHA-256;
+#   3. скачивает dbghelp.dll из этого репозитория (runtime озвучки + загрузчик EML) и сверяет SHA-256;
 #   4. запускает установщик: проверки сборки игры и сигнатур, копирование файлов,
-#      DLL overrides для Proton, резервная копия индекса, маркер автовключения.
+#      DLL override для Proton, резервная копия индекса, маркер автовключения.
+#      Установку прошлой версии (через winmm.dll) тот же запуск обновляет на месте.
 set -euo pipefail
 
 REPO="victor-zelinskiy/voices-of-embervale-ru"
@@ -29,10 +30,11 @@ TOOL_DIR="$HOME/.local/share/voices-of-embervale-ru"
 CACHE_DIR="$HOME/.cache/voices-of-embervale-ru"
 TOOL="$TOOL_DIR/ru_voice_steamos.py"
 TOOL_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/linux/ru_voice_steamos.py"
-# Runtime built from runtime/voice_runtime.c with ru_voice_autostart.txt support (gamepad: no F3 needed).
-RUNTIME_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/linux/bin/shroudtopia.dll"
-RUNTIME_SHA="1f4a357498d7563fe18aca4c2bdff640d854d593ea6c2b37d56b6ba22fa23d2f"
-RUNTIME="$TOOL_DIR/shroudtopia.dll"
+# Runtime built from runtime/voice_runtime.c as a dbghelp.dll proxy that chain-loads EML (Proton ignores
+# winmm.dll in the game folder) and turns Russian voice on at startup (gamepad: no F3 needed).
+RUNTIME_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/linux/bin/dbghelp.dll"
+RUNTIME_SHA="aa30449865d7a2d1540efdbe634b659649e0f3a3a40d689365582f371e63b15d"
+RUNTIME="$TOOL_DIR/dbghelp.dll"
 ASSET_URL="https://github.com/$MOD_REPO/releases/download/$TAG/$ASSET"
 ZIP="$CACHE_DIR/$ASSET"
 
@@ -85,7 +87,7 @@ if [ ! -f "$RUNTIME" ] || [ "$(sha256sum "$RUNTIME" | awk '{print $1}')" != "$RU
 fi
 if [ "$(sha256sum "$RUNTIME" | awk '{print $1}')" != "$RUNTIME_SHA" ]; then
   rm -f "$RUNTIME"
-  echo "!! shroudtopia.dll повреждён (SHA-256 не совпал). Запустите команду ещё раз." >&2
+  echo "!! dbghelp.dll (runtime) повреждён (SHA-256 не совпал). Запустите команду ещё раз." >&2
   exit 1
 fi
 echo "    SHA-256 OK"

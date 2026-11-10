@@ -266,11 +266,38 @@ static DWORD WINAPI install_hooks(void *unused) {
     return 0;
 }
 
+#ifdef RU_VOICE_DBGHELP_CHAIN
+#include "dbghelp_forwards.h"
+
+/* Built as dbghelp.dll (exports from dbghelp_forwards.h): Proton loads this proxy from the game folder, while
+ * winmm.dll there is ignored. Every dbghelp export forwards to EML renamed to eml_dbghelp.dll, which
+ * patches the game index in its own DllMain and forwards on to the system dbghelp. */
+static void load_eml(HINSTANCE module) {
+    wchar_t path[MAX_PATH];
+    DWORD count = GetModuleFileNameW(module, path, MAX_PATH);
+    wchar_t *slash = count && count < MAX_PATH - 32 ? wcsrchr(path, L'\\') : NULL;
+    if (!slash) {
+        log_line("EML chain: module path unavailable");
+        return;
+    }
+    wcscpy(slash + 1, L"eml_dbghelp.dll");
+    if (!LoadLibraryW(path)) {
+        char message[96];
+        sprintf_s(message, sizeof(message), "EML chain: eml_dbghelp.dll load failed, error %lu", GetLastError());
+        log_line(message);
+    }
+}
+#endif
+
 BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         self_module = module;
         DisableThreadLibraryCalls(module);
+#ifdef RU_VOICE_DBGHELP_CHAIN
+        log_line("Russian voice runtime loaded as dbghelp.dll proxy");
+        load_eml(module);
+#endif
         HANDLE worker = CreateThread(NULL, 0, install_hooks, NULL, 0, NULL);
         if (worker) CloseHandle(worker);
     }

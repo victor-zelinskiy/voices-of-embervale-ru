@@ -3,7 +3,9 @@
 
 Linux-замена VoiceInstaller.exe. Повторяет его проверки (сборка игры, сигнатуры
 аудиофункций, SHA-256 всех файлов пакета, конфликты DLL) и добавляет то, что нужно
-только под Proton: DLL overrides для dbghelp.dll (EML) и winmm.dll (Shroudtopia).
+только под Proton. Proton не загружает winmm.dll (Shroudtopia) из папки игры, поэтому
+наш runtime ставится как dbghelp.dll и сам подгружает EML (eml_dbghelp.dll); нужен один
+DLL override для dbghelp. Озвучка включается при запуске (ru_voice_autostart.txt), без F3.
 Индекс игры встраивает сам EML при первом запуске игры, как это задумано для Linux.
 
     python3 ru_voice_steamos.py install [ZIP или папка архива] [--game ПАПКА]
@@ -31,7 +33,14 @@ from pathlib import Path
 APP_ID = "1203620"
 MOD_ID = "ru_voice_separate_525"
 LEGACY_MOD_ID = "ru_voice_separate_520"
-DLLS = ("dbghelp.dll", "winmm.dll", "shroudtopia.dll")
+DLLS = ("dbghelp.dll", "winmm.dll", "shroudtopia.dll")  # native/ entries of the package
+# Proton does not load winmm.dll (Shroudtopia) from the game folder, but it does load dbghelp.dll there,
+# as EML proves. Our runtime (runtime/voice_runtime.c built with RU_VOICE_DBGHELP_CHAIN) takes the
+# dbghelp.dll slot and chain-loads EML renamed to eml_dbghelp.dll.
+RUNTIME_DLL = "dbghelp.dll"
+EML_DLL = "eml_dbghelp.dll"
+LEGACY_DLLS = ("winmm.dll", "shroudtopia.dll")
+LAYOUT = 2
 INDEX_FILES = ("enshrouded.kfc", "enshrouded.kfc_resources")
 EXPECTED_PAYLOAD_FILES = 1764
 EXPECTED_MAPS = 1118
@@ -41,11 +50,12 @@ WINDOWS_STATE = Path(".ru_voice_backup") / "state.json"
 LOG_NAME = "ru_voice_installer.log"
 # Read by the runtime DLL built from runtime/voice_runtime.c: Russian voice is on from game start.
 AUTOSTART_MARKER = "ru_voice_autostart.txt"
+AUTOSTART_TEXT = "Русская озвучка включается при запуске игры. Удалите файл, чтобы включать её только по F3.\n"
 PACKAGE_GLOB = "Voices-of-Embervale-RU-*"
-OVERRIDES = {"dbghelp": "native,builtin", "winmm": "native,builtin"}
+OVERRIDES = {"dbghelp": "native,builtin"}
 # Per-exe overrides: only enshrouded.exe prefers the DLLs from the game folder.
 REG_SECTION = r"[Software\\Wine\\AppDefaults\\enshrouded.exe\\DllOverrides]"
-LAUNCH_OPTIONS = 'WINEDLLOVERRIDES="dbghelp,winmm=n,b" %command%'
+LAUNCH_OPTIONS = 'WINEDLLOVERRIDES="dbghelp=n,b" %command%'
 VERSION_RE = re.compile(rb"(?<!\d)(\d{6,10})\|\^/game\d+/branches/release_(\d+)\.(\d+)\|[^\x00\r\n]{1,100}")
 REG_VALUE_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"=(.*)$')
 # Same function entry signatures as installer/Program.cs and runtime/voice_runtime.c.
@@ -582,6 +592,63 @@ def windows_install_active(game: Path) -> bool:
         return False
 
 
+def find_runtime_dll(explicit: str | None) -> Path:
+    here = Path(sys.argv[0]).resolve().parent
+    for candidate in ([Path(explicit).expanduser()] if explicit else [here / RUNTIME_DLL, here / "bin" / RUNTIME_DLL]):
+        if candidate.is_file():
+            return candidate.resolve()
+    raise Fail("Не найдена runtime-DLL (dbghelp.dll из linux/bin). Установите мод однострочником из README_STEAMOS.md "
+               "или передайте --runtime-dll /путь/к/dbghelp.dll")
+
+
+def migrate_layout(game: Path, library: Path | None, state: dict, runtime_dll: Path) -> None:
+    """Switch an install made through winmm.dll/shroudtopia.dll to the dbghelp.dll chain in place.
+
+    Mod files and the EML-patched index stay as they are, so nothing is downloaded or re-patched.
+    """
+    say("Обновляю установку: русская озвучка теперь загружается через dbghelp.dll вместо winmm.dll…")
+    owned = state.get("owned_dlls", {})
+    eml_hash = owned.get("dbghelp.dll")
+    current, eml = game / RUNTIME_DLL, game / EML_DLL
+    if not eml_hash or not current.is_file() or sha256(current) != eml_hash:
+        raise Fail("dbghelp.dll изменён после установки. Выполните uninstall, затем install.")
+    if eml.exists() and sha256(eml) != eml_hash:
+        raise Fail(f"Конфликт: в папке игры уже есть другой {EML_DLL}.")
+    runtime_hash = sha256(runtime_dll)
+    os.replace(current, eml)
+    try:
+        shutil.copyfile(runtime_dll, current)
+        if sha256(current) != runtime_hash:
+            raise Fail("Не удалось скопировать runtime-DLL.")
+    except BaseException:
+        os.replace(eml, current)
+        raise
+    for dll in LEGACY_DLLS:
+        target = game / dll
+        if dll in owned and target.is_file():
+            if sha256(target) == owned[dll]:
+                target.unlink()
+            else:
+                say(f"  {dll} изменён после установки — оставлен на месте.")
+    overrides = state.get("overrides")
+    if overrides:
+        legacy = {name: value for name, value in overrides["previous"].items() if name not in OVERRIDES}
+        if legacy and Path(overrides["user_reg"]).is_file():
+            reg_revert(Path(overrides["user_reg"]), legacy)
+        overrides["previous"] = {name: value for name, value in overrides["previous"].items() if name in OVERRIDES}
+    else:
+        state["overrides"] = apply_overrides(game, library, game / STATE_DIR)
+    if not (game / AUTOSTART_MARKER).is_file():
+        (game / AUTOSTART_MARKER).write_text(AUTOSTART_TEXT, encoding="utf-8")
+    state["owned_dlls"] = {RUNTIME_DLL: runtime_hash, EML_DLL: eml_hash}
+    state["autostart"] = True
+    state["layout"] = LAYOUT
+    state["layout_at"] = time.time()
+    save_state(game, state)
+    log(game, "OK linux layout migration to dbghelp chain")
+    say("Готово. Запустите игру: русская озвучка включится сама. Потом проверьте:  " + COMMAND_HINT + " status")
+
+
 def cmd_install(args) -> None:
     game, library = find_game(args.game)
     say(f"Папка игры: {game}")
@@ -591,8 +658,12 @@ def cmd_install(args) -> None:
     ensure_closed()
     version = check_game(game)
     say(f"Версия игры: {version.split('|')[0]} — поддерживается, аудиофункции найдены однозначно.")
+    runtime_dll = find_runtime_dll(args.runtime_dll)
     state = read_state(game)
     if state and state.get("status") == "installed":
+        if state.get("layout", 1) < LAYOUT:
+            migrate_layout(game, library, state, runtime_dll)
+            return
         raise Fail("Мод уже установлен этим скриптом. Проверка: status. Переустановка: uninstall, затем install.")
     mods = game / "mods"
     if (mods / LEGACY_MOD_ID).exists():
@@ -610,15 +681,10 @@ def cmd_install(args) -> None:
     say(f"Пакет мода: {source}")
     package = Package(source)
     files = package.manifest()
-    dll_hashes = {dll: files["native/" + dll].lower() for dll in DLLS}
-    runtime_dll = Path(args.runtime_dll).expanduser().resolve() if args.runtime_dll else None
-    if runtime_dll:
-        if not runtime_dll.is_file():
-            raise Fail(f"Не найден {runtime_dll}")
-        dll_hashes["shroudtopia.dll"] = sha256(runtime_dll)
-    for dll in DLLS:
+    dll_hashes = {RUNTIME_DLL: sha256(runtime_dll), EML_DLL: files["native/dbghelp.dll"].lower()}
+    for dll, digest in dll_hashes.items():
         target = game / dll
-        if target.exists() and sha256(target) != dll_hashes[dll]:
+        if target.exists() and sha256(target) != digest:
             raise Fail(f"Конфликт: в папке игры уже есть другой {dll} (другой мод или версия EML). Установка остановлена.")
     payload_size = sum(package.size(rel) for rel in files if rel.startswith(("mod/", "native/")))
     index_size = sum((game / name).stat().st_size for name in INDEX_FILES)
@@ -659,23 +725,22 @@ def cmd_install(args) -> None:
         if manifest_id != MOD_ID:
             raise Fail(f"Неожиданный id мода в пакете: {manifest_id}")
 
-        if runtime_dll:
-            shutil.copyfile(runtime_dll, staging / "native/shroudtopia.dll")
-            if sha256(staging / "native/shroudtopia.dll") != dll_hashes["shroudtopia.dll"]:
-                raise Fail("Не удалось скопировать runtime-DLL.")
+        sources = {RUNTIME_DLL: staging / "runtime.dll", EML_DLL: staging / "native/dbghelp.dll"}
+        shutil.copyfile(runtime_dll, sources[RUNTIME_DLL])
+        if sha256(sources[RUNTIME_DLL]) != dll_hashes[RUNTIME_DLL]:
+            raise Fail("Не удалось скопировать runtime-DLL.")
 
         mods.mkdir(exist_ok=True)
         os.replace(staging / "mod", mods / MOD_ID)
         mod_created = True
-        for dll in DLLS:
+        for dll, source in sources.items():
             if not (game / dll).exists():
-                os.replace(staging / "native" / dll, game / dll)
+                os.replace(source, game / dll)
                 state["owned_dlls"][dll] = dll_hashes[dll]
-        if runtime_dll:
-            (game / AUTOSTART_MARKER).write_text(
-                "Русская озвучка включается при запуске игры. Удалите файл, чтобы включать её только по F3.\n",
-                encoding="utf-8")
-        state["autostart"] = bool(runtime_dll)
+        (game / AUTOSTART_MARKER).write_text(AUTOSTART_TEXT, encoding="utf-8")
+        state["autostart"] = True
+        state["layout"] = LAYOUT
+        state["layout_at"] = time.time()
         save_state(game, state)
 
         state["overrides"] = apply_overrides(game, library, state_dir)
@@ -764,10 +829,14 @@ def cmd_status(args) -> None:
     else:
         say("Файлы мода: нет")
         problems.append("Мод не установлен.")
-    for dll in DLLS:
+    if state and state.get("status") == "installed" and state.get("layout", 1) < LAYOUT:
+        problems.append(f"Установка старой версии (через winmm.dll, Proton её не загружает). Обновите: {COMMAND_HINT} install")
+    legacy = bool(state) and state.get("status") == "installed" and state.get("layout", 1) < LAYOUT
+    loaders = (RUNTIME_DLL,) if legacy else (RUNTIME_DLL, EML_DLL)
+    for dll in loaders:
         if not (game / dll).is_file():
             problems.append(f"Нет {dll} в папке игры.")
-    say("DLL загрузчиков: " + ("OK" if all((game / dll).is_file() for dll in DLLS) else "НЕ ВСЕ"))
+    say("DLL загрузчиков: " + ("OK" if all((game / dll).is_file() for dll in loaders) else "НЕ ВСЕ"))
     say("Автовключение озвучки при запуске: " + ("да" if (game / AUTOSTART_MARKER).is_file() else "нет (переключение по F3)"))
     ok, where = overrides_status(library)
     say(f"DLL overrides для Proton: {'OK, ' if ok else 'НЕТ — '}{where}")
@@ -800,9 +869,12 @@ def cmd_status(args) -> None:
         elif (game / AUTOSTART_MARKER).is_file() and not any("ON at startup" in line for line in tail):
             problems.append("Автовключение не сработало: установлена DLL без поддержки ru_voice_autostart.txt, нужна F3.")
     else:
-        say("ru_voice_runtime.log: нет (winmm.dll/shroudtopia.dll ещё не загружались).")
-        if summary is not None:
-            problems.append("EML работает, но shroudtopia.dll не загрузилась: проверьте override для winmm.")
+        say("ru_voice_runtime.log: нет (runtime-DLL ещё не загружалась).")
+        launched_since = summary is not None and summary["file"].stat().st_mtime > (state or {}).get("layout_at", 0)
+        if state and state.get("layout", 1) >= LAYOUT and not launched_since:
+            problems.append("Запустите игру один раз и снова выполните status.")
+        elif summary is not None and not legacy:
+            problems.append("EML работает, но runtime озвучки не загрузился. Пришлите этот вывод status.")
     say()
     if problems:
         say("Нужно внимание:")
@@ -908,7 +980,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command")
     install = sub.add_parser("install", help="установить мод (по умолчанию)")
     install.add_argument("source", nargs="?", help="ZIP-архив мода или распакованная папка")
-    install.add_argument("--runtime-dll", help="shroudtopia.dll с автовключением озвучки вместо DLL из пакета")
+    install.add_argument("--runtime-dll", help="runtime озвучки dbghelp.dll (по умолчанию рядом со скриптом или в bin/)")
     sub.add_parser("status", help="проверить установку и журналы после запуска игры")
     uninstall = sub.add_parser("uninstall", help="удалить мод и вернуть игровой индекс")
     uninstall.add_argument("--keep-backup", action="store_true", help="оставить резервную копию индекса")
