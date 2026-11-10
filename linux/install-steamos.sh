@@ -13,8 +13,9 @@
 # Что делает install (можно запускать повторно):
 #   1. скачивает ru_voice_steamos.py (установщик) из этого репозитория;
 #   2. скачивает полный архив мода из GitHub Releases автора (Daber-devNull) и сверяет SHA-256;
-#   3. запускает установщик: проверки сборки игры и сигнатур, копирование файлов,
-#      DLL overrides для Proton, резервная копия индекса.
+#   3. скачивает shroudtopia.dll из этого репозитория (runtime с автовключением озвучки) и сверяет SHA-256;
+#   4. запускает установщик: проверки сборки игры и сигнатур, копирование файлов,
+#      DLL overrides для Proton, резервная копия индекса, маркер автовключения.
 set -euo pipefail
 
 REPO="victor-zelinskiy/voices-of-embervale-ru"
@@ -28,6 +29,10 @@ TOOL_DIR="$HOME/.local/share/voices-of-embervale-ru"
 CACHE_DIR="$HOME/.cache/voices-of-embervale-ru"
 TOOL="$TOOL_DIR/ru_voice_steamos.py"
 TOOL_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/linux/ru_voice_steamos.py"
+# Runtime built from runtime/voice_runtime.c with ru_voice_autostart.txt support (gamepad: no F3 needed).
+RUNTIME_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/linux/bin/shroudtopia.dll"
+RUNTIME_SHA="1f4a357498d7563fe18aca4c2bdff640d854d593ea6c2b37d56b6ba22fa23d2f"
+RUNTIME="$TOOL_DIR/shroudtopia.dll"
 ASSET_URL="https://github.com/$MOD_REPO/releases/download/$TAG/$ASSET"
 ZIP="$CACHE_DIR/$ASSET"
 
@@ -74,8 +79,19 @@ else
   echo "    SHA-256 OK"
 fi
 
+echo "==> Runtime-DLL с автовключением озвучки…"
+if [ ! -f "$RUNTIME" ] || [ "$(sha256sum "$RUNTIME" | awk '{print $1}')" != "$RUNTIME_SHA" ]; then
+  curl -fsSL -o "$RUNTIME" "$RUNTIME_URL"
+fi
+if [ "$(sha256sum "$RUNTIME" | awk '{print $1}')" != "$RUNTIME_SHA" ]; then
+  rm -f "$RUNTIME"
+  echo "!! shroudtopia.dll повреждён (SHA-256 не совпал). Запустите команду ещё раз." >&2
+  exit 1
+fi
+echo "    SHA-256 OK"
+
 echo "==> Установка…"
-python3 "$TOOL" install "$ZIP" "$@"
+python3 "$TOOL" install "$ZIP" --runtime-dll "$RUNTIME" "$@"
 
 echo
 echo "Архив сохранён в $ZIP (нужен только для переустановки; можно удалить)."

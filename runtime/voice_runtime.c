@@ -115,6 +115,17 @@ static void log_line(const char *message) {
     CloseHandle(file);
 }
 
+/* Gamepad/SteamOS installs drop ru_voice_autostart.txt next to the game so no F3 press is needed. */
+static int autostart_requested(void) {
+    wchar_t path[MAX_PATH];
+    DWORD count = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!count || count >= MAX_PATH - 32) return 0;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (!slash) return 0;
+    wcscpy(slash + 1, L"ru_voice_autostart.txt");
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
 static unsigned char *find_unique_code(unsigned char *base, const unsigned char *signature, size_t size) {
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return NULL;
@@ -224,6 +235,10 @@ static DWORD WINAPI install_hooks(void *unused) {
         return 0;
     }
     log_line("Russian voice hooks active after unique signature validation");
+    if (autostart_requested()) {
+        InterlockedExchange(&force_russian, 1);
+        log_line("Russian voice ON at startup (ru_voice_autostart.txt)");
+    }
     status_window = create_status_window();
     if (!status_window) log_line("Russian voice status overlay unavailable");
     if (RegisterHotKey(NULL, 0x5255, MOD_NOREPEAT, VK_F3)) {

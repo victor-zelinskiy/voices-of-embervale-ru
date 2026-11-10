@@ -9,3 +9,5 @@ cmd /c '"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\V
 ```
 
 The runtime locates three audio functions by unique code signatures and refuses to install hooks when they are missing or ambiguous. The installer also checks the minimum game build and validates the signatures before modifying files. Runtime diagnostics go to `ru_voice_runtime.log` next to `enshrouded.exe`.
+
+If `ru_voice_autostart.txt` exists next to `enshrouded.exe`, Russian voice is enabled at startup without pressing F3 (the SteamOS installer creates it). `linux/bin/shroudtopia.dll` is this source built with the command above (MSVC 14.40).

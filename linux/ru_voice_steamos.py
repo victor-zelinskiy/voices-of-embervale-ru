@@ -39,6 +39,8 @@ MIN_BUILD = 1269579
 STATE_DIR = ".ru_voice_linux"
 WINDOWS_STATE = Path(".ru_voice_backup") / "state.json"
 LOG_NAME = "ru_voice_installer.log"
+# Read by the runtime DLL built from runtime/voice_runtime.c: Russian voice is on from game start.
+AUTOSTART_MARKER = "ru_voice_autostart.txt"
 PACKAGE_GLOB = "Voices-of-Embervale-RU-*"
 OVERRIDES = {"dbghelp": "native,builtin", "winmm": "native,builtin"}
 # Per-exe overrides: only enshrouded.exe prefers the DLLs from the game folder.
@@ -608,9 +610,15 @@ def cmd_install(args) -> None:
     say(f"Пакет мода: {source}")
     package = Package(source)
     files = package.manifest()
+    dll_hashes = {dll: files["native/" + dll].lower() for dll in DLLS}
+    runtime_dll = Path(args.runtime_dll).expanduser().resolve() if args.runtime_dll else None
+    if runtime_dll:
+        if not runtime_dll.is_file():
+            raise Fail(f"Не найден {runtime_dll}")
+        dll_hashes["shroudtopia.dll"] = sha256(runtime_dll)
     for dll in DLLS:
         target = game / dll
-        if target.exists() and sha256(target) != files["native/" + dll].lower():
+        if target.exists() and sha256(target) != dll_hashes[dll]:
             raise Fail(f"Конфликт: в папке игры уже есть другой {dll} (другой мод или версия EML). Установка остановлена.")
     payload_size = sum(package.size(rel) for rel in files if rel.startswith(("mod/", "native/")))
     index_size = sum((game / name).stat().st_size for name in INDEX_FILES)
@@ -630,7 +638,7 @@ def cmd_install(args) -> None:
         "installed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "original": {}, "dat_lengths_before": dat_lengths(game), "owned_dlls": {},
         "mod_files": sum(1 for rel in files if rel.startswith("mod/")), "overrides": None,
-        "preexisting": {name: (game / name).exists() for name in ("enshrouded.kfc.bak", ".cache", "eml.json", "mods")},
+        "preexisting": {name: (game / name).exists() for name in ("enshrouded.kfc.bak", ".cache", "eml.json", "mods", AUTOSTART_MARKER)},
     }
     mod_created = False
     try:
@@ -651,13 +659,23 @@ def cmd_install(args) -> None:
         if manifest_id != MOD_ID:
             raise Fail(f"Неожиданный id мода в пакете: {manifest_id}")
 
+        if runtime_dll:
+            shutil.copyfile(runtime_dll, staging / "native/shroudtopia.dll")
+            if sha256(staging / "native/shroudtopia.dll") != dll_hashes["shroudtopia.dll"]:
+                raise Fail("Не удалось скопировать runtime-DLL.")
+
         mods.mkdir(exist_ok=True)
         os.replace(staging / "mod", mods / MOD_ID)
         mod_created = True
         for dll in DLLS:
             if not (game / dll).exists():
                 os.replace(staging / "native" / dll, game / dll)
-                state["owned_dlls"][dll] = files["native/" + dll].lower()
+                state["owned_dlls"][dll] = dll_hashes[dll]
+        if runtime_dll:
+            (game / AUTOSTART_MARKER).write_text(
+                "Русская озвучка включается при запуске игры. Удалите файл, чтобы включать её только по F3.\n",
+                encoding="utf-8")
+        state["autostart"] = bool(runtime_dll)
         save_state(game, state)
 
         state["overrides"] = apply_overrides(game, library, state_dir)
@@ -673,6 +691,8 @@ def cmd_install(args) -> None:
                 (game / dll).unlink()
         if state.get("overrides"):
             reg_revert(Path(state["overrides"]["user_reg"]), state["overrides"]["previous"])
+        if not state["preexisting"][AUTOSTART_MARKER] and (game / AUTOSTART_MARKER).is_file():
+            (game / AUTOSTART_MARKER).unlink()
         shutil.rmtree(staging, ignore_errors=True)
         if created_state_dir:
             shutil.rmtree(state_dir, ignore_errors=True)
@@ -696,8 +716,12 @@ def cmd_install(args) -> None:
     say("Дальше:")
     say("  1. Запустите Enshrouded из Steam (можно в игровом режиме). Первый запуск дольше обычного:")
     say(f"     загрузчик EML один раз встраивает {EXPECTED_MAPS} записей в индекс игры (до нескольких минут).")
-    say("  2. Если язык игры русский, озвучка включается автоматически. При другом языке её переключает F3;")
-    say("     на геймпаде назначьте F3 на кнопку: Steam → Enshrouded → Раскладка контроллера.")
+    if state.get("autostart"):
+        say("  2. Русская озвучка включается сама при каждом запуске игры — на геймпаде ничего нажимать не нужно.")
+        say("     (F3 на клавиатуре временно выключает и снова включает её.)")
+    else:
+        say("  2. Если язык игры русский, озвучка включается автоматически. При другом языке её переключает F3;")
+        say("     на геймпаде назначьте F3 на кнопку: Steam → Enshrouded → Раскладка контроллера.")
     say(f"  3. После первого запуска выйдите из игры и проверьте:  {COMMAND_HINT} status")
 
 
@@ -744,6 +768,7 @@ def cmd_status(args) -> None:
         if not (game / dll).is_file():
             problems.append(f"Нет {dll} в папке игры.")
     say("DLL загрузчиков: " + ("OK" if all((game / dll).is_file() for dll in DLLS) else "НЕ ВСЕ"))
+    say("Автовключение озвучки при запуске: " + ("да" if (game / AUTOSTART_MARKER).is_file() else "нет (переключение по F3)"))
     ok, where = overrides_status(library)
     say(f"DLL overrides для Proton: {'OK, ' if ok else 'НЕТ — '}{where}")
     if not ok:
@@ -772,6 +797,8 @@ def cmd_status(args) -> None:
                            or "installation failed" in line or "initialization failed" in line), "")
         if "hooks active" not in last_start:
             problems.append("Хуки озвучки не установились: см. ru_voice_runtime.log.")
+        elif (game / AUTOSTART_MARKER).is_file() and not any("ON at startup" in line for line in tail):
+            problems.append("Автовключение не сработало: установлена DLL без поддержки ru_voice_autostart.txt, нужна F3.")
     else:
         say("ru_voice_runtime.log: нет (winmm.dll/shroudtopia.dll ещё не загружались).")
         if summary is not None:
@@ -834,6 +861,8 @@ def cmd_uninstall(args) -> None:
                 target.unlink()
             else:
                 say(f"  {dll} изменён после установки — оставлен на месте.")
+    if not state.get("preexisting", {}).get(AUTOSTART_MARKER) and (game / AUTOSTART_MARKER).is_file():
+        (game / AUTOSTART_MARKER).unlink()
     if state.get("overrides"):
         user_reg = Path(state["overrides"]["user_reg"])
         if user_reg.is_file():
@@ -879,6 +908,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command")
     install = sub.add_parser("install", help="установить мод (по умолчанию)")
     install.add_argument("source", nargs="?", help="ZIP-архив мода или распакованная папка")
+    install.add_argument("--runtime-dll", help="shroudtopia.dll с автовключением озвучки вместо DLL из пакета")
     sub.add_parser("status", help="проверить установку и журналы после запуска игры")
     uninstall = sub.add_parser("uninstall", help="удалить мод и вернуть игровой индекс")
     uninstall.add_argument("--keep-backup", action="store_true", help="оставить резервную копию индекса")
@@ -890,6 +920,7 @@ def main() -> int:
     command = args.command or "install"
     if command == "install" and not hasattr(args, "source"):
         args.source = None
+        args.runtime_dll = None
     try:
         {"install": cmd_install, "status": cmd_status, "uninstall": cmd_uninstall, "overrides": cmd_overrides}[command](args)
     except Fail as error:
