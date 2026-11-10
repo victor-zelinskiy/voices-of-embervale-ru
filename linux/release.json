@@ -1,0 +1,25 @@
+{
+  "revision": 2,
+  "name": "0.3.3-beta+steamos",
+  "maps": 1118,
+  "package": {
+    "name": "Voices-of-Embervale-RU-0.3.3-beta-Nexus.zip",
+    "url": "https://github.com/Daber-devNull/voices-of-embervale-ru/releases/download/v0.3.3-beta/Voices-of-Embervale-RU-0.3.3-beta-Nexus.zip",
+    "sha256": "064497de79459c626e4e9a1e34f3a8dfbc8b667bd4e241ecc5e316447806ece4",
+    "files": 1764
+  },
+  "tool": {
+    "path": "linux/ru_voice_steamos.py",
+    "sha256": "dd22f02f65b9cab4709d0bb4b5bb293e92320cb2813db4557bddfb1fbfc4908d"
+  },
+  "runtime": {
+    "path": "linux/bin/dbghelp.dll",
+    "sha256": "aa30449865d7a2d1540efdbe634b659649e0f3a3a40d689365582f371e63b15d"
+  },
+  "checker": {
+    "path": "linux/bin/emm-check.gz",
+    "sha256": "5bf1b9a8090ab28a0568dfda876c6f171eb33f713cdb2dbd1764f29d7fa980f7",
+    "unpacked_sha256": "9addc8cc65dc90b15addaf8e758b53aa7e1d888075821279412df79a0e615458"
+  },
+  "overlay": {}
+}

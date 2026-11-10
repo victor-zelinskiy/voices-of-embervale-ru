@@ -1,0 +1,152 @@
+diff -ruN a/crates/mod-loader-lua/src/env/app_state.rs b/crates/mod-loader-lua/src/env/app_state.rs
+--- a/crates/mod-loader-lua/src/env/app_state.rs
++++ b/crates/mod-loader-lua/src/env/app_state.rs
+@@ -31,6 +31,7 @@
+ 
+     feature_flags: AppFeatures,
+     export_dir: PathBuf,
++    dry_run: bool,
+ }
+ 
+ bitflags! {
+@@ -80,6 +81,7 @@
+             .unwrap_or_else(|| env.game_dir().join("export"));
+ 
+         let skip_cache = options.skip_cache;
++        let dry_run = options.dry_run;
+         let is_server = options.is_server
+             .unwrap_or_else(|| file_name.to_lowercase().contains("server"));
+ 
+@@ -104,6 +106,7 @@
+             is_server,
+ 
+             feature_flags,
++            dry_run,
+         };
+ 
+         // load and attach to resources
+@@ -116,7 +119,7 @@
+         crate::load::export_lua_definitions(
+             cache_dir,
+             &type_registry,
+-            options.skip_cache || is_dirty || cache_diff.build_id_changed(),
++            !dry_run && (options.skip_cache || is_dirty || cache_diff.build_id_changed()),
+         );
+         let type_registry = Rc::new(type_registry);
+ 
+@@ -346,12 +349,15 @@
+         let guid = ContentHash::from_data(data);
+ 
+         if let hash_map::Entry::Vacant(e) = self.new_contents.borrow_mut().entry(guid) {
++            // A dry run must not touch the .dat containers: keep the content in memory only.
++            if !self.config.dry_run {
+             self.writer.borrow_mut()
+                 .as_mut()
+                 .ok_or_else(|| LuaError::generic(
+                     "cannot create content: KFCWriter is no longer available"
+                 ))?
+                 .write_content(&guid, data)?;
++            }
+ 
+             // TODO: attach a reader to the writer to avoid cloning
+             e.insert(data.to_vec());
+diff -ruN a/crates/mod-loader-lua/src/lib.rs b/crates/mod-loader-lua/src/lib.rs
+--- a/crates/mod-loader-lua/src/lib.rs
++++ b/crates/mod-loader-lua/src/lib.rs
+@@ -29,6 +29,9 @@
+     pub runtime: bool,
+     /// If None, it will use the default export directory (`<game_dir>/export`).
+     pub export_dir: Option<PathBuf>,
++    /// If true, it will run patch mods against the game files without writing anything
++    /// (no index, container or cache changes). Used to check mod compatibility.
++    pub dry_run: bool,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -49,6 +52,12 @@
+ ) -> anyhow::Result<RunResult> {
+     info!("Running lua with options: {:?}", args);
+ 
++    let dry_run = args.options.dry_run;
++
++    if dry_run {
++        args.options.patch = true;
++    }
++
+     // check cache if files have changed
+ 
+     let cache_diff = if !args.options.skip_cache {
+@@ -60,7 +69,7 @@
+ 
+         let cache_diff = new_cache.diff(&current_cache);
+ 
+-        if cache_diff.is_none() && args.options.patch {
++        if cache_diff.is_none() && args.options.patch && !dry_run {
+             args.options.patch = false;
+ 
+             info!("No changes detected, skipping patching");
+@@ -104,6 +113,11 @@
+ 
+     runner.run()?;
+ 
++    if dry_run {
++        info!("Dry run complete, no files were written");
++        return Ok(RunResult::default());
++    }
++
+     let app_state = runner.lua.app_data_ref::<AppState>().unwrap();
+ 
+     if app_state.has_feature(AppFeatures::PATCH) {
+diff -ruN a/crates/mod-manager-cli/src/cli.rs b/crates/mod-manager-cli/src/cli.rs
+--- a/crates/mod-manager-cli/src/cli.rs
++++ b/crates/mod-manager-cli/src/cli.rs
+@@ -50,6 +50,10 @@
+         /// Force patching even if already patched
+         #[arg(short, long, default_value_t = false)]
+         force: bool,
++
++        /// Run patch mods to check compatibility without writing any files
++        #[arg(long, default_value_t = false)]
++        dry_run: bool,
+     },
+ 
+     /// Restore the original enshrouded files
+diff -ruN a/crates/mod-manager-cli/src/main.rs b/crates/mod-manager-cli/src/main.rs
+--- a/crates/mod-manager-cli/src/main.rs
++++ b/crates/mod-manager-cli/src/main.rs
+@@ -31,7 +31,8 @@
+             game_directory,
+             export_directory,
+             file_name,
+-            force
++            force,
++            dry_run
+         } => run(
+             game_directory,
+             file_name,
+@@ -41,7 +42,8 @@
+             export,
+             runtime,
+ 
+-            export_directory
++            export_directory,
++            dry_run
+         ),
+         Commands::Restore {
+             game_directory,
+@@ -271,6 +273,7 @@
+     export: bool,
+     _runtime: bool,
+     export_directory: Option<PathBuf>,
++    dry_run: bool,
+ ) -> Result<(), Box<dyn std::error::Error>> {
+     let export_directory = match export_directory {
+         Some(dir) => dir,
+@@ -328,6 +331,7 @@
+                 patch,
+                 export,
+                 export_dir: Some(export_directory),
++                dry_run,
+                 ..Default::default()
+             },
+         },

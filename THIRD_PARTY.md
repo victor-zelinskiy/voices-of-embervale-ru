@@ -1,6 +1,6 @@
 # Сторонние компоненты
 
-- Enshrouded Mod Loader (EML) v0.2.0, Brabb3l: `dbghelp.dll`, `emm.exe`. Исходники: [коммит 16708594](https://github.com/Brabb3l/kfc-parser/tree/16708594d686b030d909f2d835b199d879ea9ad8); лицензия GPL-3.0-or-later. Копия исходников также включена в отдельный пакет исходного кода проекта.
+- Enshrouded Mod Loader (EML) v0.2.0, Brabb3l: `dbghelp.dll`, `emm.exe`. Исходники: [коммит 16708594](https://github.com/Brabb3l/kfc-parser/tree/16708594d686b030d909f2d835b199d879ea9ad8); лицензия GPL-3.0-or-later. Копия исходников также включена в отдельный пакет исходного кода проекта. Для SteamOS `linux/bin/emm-check.gz` собран под Linux из этих исходников с изменением `patches/eml-0.2.0-dry-run.patch` (режим `--dry-run`, проверка мода без записи файлов); лицензия та же, GPL-3.0-or-later.
 - Shroudtopia v0.1.1, s0t7x: `winmm.dll`. [Исходный код и MIT](https://github.com/s0t7x/shroudtopia).
 - MinHook v1.3.4, TsudaKageyu: встроен в `shroudtopia.dll` этого проекта. [Исходный код и BSD 2-Clause](https://github.com/TsudaKageyu/minhook).
 - Установщик использует .NET 8 от Microsoft; [лицензия .NET Runtime](https://github.com/dotnet/runtime/blob/main/LICENSE.TXT).

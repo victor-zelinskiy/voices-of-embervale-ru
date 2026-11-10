@@ -12,20 +12,30 @@ DLL override для dbghelp. Озвучка включается при запу
     python3 ru_voice_steamos.py status
     python3 ru_voice_steamos.py uninstall [--keep-backup]
     python3 ru_voice_steamos.py overrides
+    python3 ru_voice_steamos.py launch -- %command%   (ставится в параметры запуска Steam)
+
+Автообновление: install прописывает в параметры запуска игры launch.sh. Перед каждым запуском
+он сверяет linux/release.json в форке, сам ставит обновления, проверяет совместимость мода
+с текущей сборкой игры (нативный EML с --dry-run, ничего не записывает) и при несовместимости
+временно отключает мод и показывает сообщение. Игра запускается в любом случае.
 
 Только стандартная библиотека Python 3.8+.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
 import struct
+import subprocess
 import sys
 import time
+import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +78,26 @@ HOOK_SIGNATURES = (
 
 # How the user re-runs this tool: the curl one-liner sets RU_VOICE_HINT, a local run uses its own path.
 COMMAND_HINT = os.environ.get("RU_VOICE_HINT") or f"python3 {Path(sys.argv[0]).resolve()}"
+
+# Autoupdate: linux/release.json in the fork is the single source of versions and hashes.
+# The env overrides exist for tests (file:// URLs work too).
+RAW_BASE = os.environ.get("RU_VOICE_RAW_BASE", "https://raw.githubusercontent.com/victor-zelinskiy/voices-of-embervale-ru/main/")
+RELEASE_URL = os.environ.get("RU_VOICE_RELEASE_URL", RAW_BASE + "linux/release.json")
+TOOL_HOME = Path.home() / ".local/share/voices-of-embervale-ru"
+CACHE_HOME = Path.home() / ".cache/voices-of-embervale-ru"
+TOOL = TOOL_HOME / "ru_voice_steamos.py"
+LAUNCHER = TOOL_HOME / "launch.sh"
+CHECKER = TOOL_HOME / "emm-check"
+DISABLED_SUFFIX = ".ru_voice_off"
+UI_TITLE = "Голоса Эмбервейла"
+LAUNCHER_SCRIPT = """#!/usr/bin/env bash
+# Голоса Эмбервейла: параметр запуска Enshrouded в Steam ("<этот файл> %command%").
+# Перед стартом проверяет обновления мода и совместимость с игрой (обычно меньше секунды),
+# затем запускает игру ровно один раз. Сбой или зависание проверки не мешают запуску игры.
+TOOL="$HOME/.local/share/voices-of-embervale-ru/ru_voice_steamos.py"
+[ -f "$TOOL" ] && timeout 900 python3 "$TOOL" launch
+exec "$@"
+"""
 
 
 class Fail(Exception):
@@ -388,7 +418,7 @@ class Package:
     def size(self, rel: str) -> int:
         return self.zip.getinfo(self.prefix + rel).file_size if self.zip else (self.root / rel).stat().st_size
 
-    def manifest(self) -> dict[str, str]:
+    def manifest(self, expected_files: int = EXPECTED_PAYLOAD_FILES) -> dict[str, str]:
         with self.open("manifest.json") as file:
             data = json.load(file)
         files = data.get("files") or data.get("Files")
@@ -400,8 +430,8 @@ class Package:
         missing = [rel for rel in required if rel not in files]
         if missing:
             raise Fail("Пакет озвучки неполный: " + ", ".join(missing))
-        if len(files) != EXPECTED_PAYLOAD_FILES:
-            raise Fail(f"Пакет озвучки неполный: {len(files)} файлов вместо {EXPECTED_PAYLOAD_FILES}. "
+        if len(files) != expected_files:
+            raise Fail(f"Пакет озвучки неполный: {len(files)} файлов вместо {expected_files}. "
                        "Этот скрипт рассчитан на полный архив 0.3.3 beta.")
         return files
 
@@ -567,6 +597,525 @@ def overrides_status(library: Path | None) -> tuple[bool, str]:
     return False, "не заданы"
 
 
+# ------------------------------------------------------------------ downloads
+
+def fetch_bytes(url: str, timeout: float) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "voices-of-embervale-ru", "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def fetch_release(timeout: float = 6) -> dict | None:
+    try:
+        release = json.loads(fetch_bytes(RELEASE_URL, timeout))
+    except (OSError, ValueError):
+        return None
+    required = ("revision", "tool", "runtime", "package")
+    return release if isinstance(release, dict) and all(key in release for key in required) else None
+
+
+def component_url(entry: dict) -> str:
+    return entry.get("url") or RAW_BASE + entry["path"]
+
+
+def download(url: str, target: Path, expected: str, progress=None) -> Path:
+    """Fetch url into target unless it already has the expected SHA-256; resumes a partial file."""
+    if target.is_file() and sha256(target) == expected:
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    part = target.with_name(target.name + ".part")
+    have = part.stat().st_size if part.is_file() else 0
+    headers = {"User-Agent": "voices-of-embervale-ru"}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as response:
+            resumed = have and response.status == 206
+            total = int(response.headers.get("Content-Length") or 0) + (have if resumed else 0)
+            done = have if resumed else 0
+            with part.open("ab" if resumed else "wb") as out:
+                for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                    out.write(chunk)
+                    done += len(chunk)
+                    if progress:
+                        progress(done, total)
+    except OSError as error:
+        raise Fail(f"Не удалось скачать {url}: {error}") from None
+    if sha256(part) != expected:
+        part.unlink()
+        raise Fail(f"Загруженный файл повреждён (SHA-256 не совпал): {url}. Запустите ещё раз.")
+    os.replace(part, target)
+    return target
+
+
+def ensure_checker(entry: dict | None) -> Path | None:
+    """Native Linux EML (patches/eml-0.2.0-dry-run.patch) that runs the Lua mod without writing anything."""
+    if not entry:
+        return None
+    if CHECKER.is_file() and sha256(CHECKER) == entry["unpacked_sha256"]:
+        return CHECKER
+    packed = download(component_url(entry), CACHE_HOME / "emm-check.gz", entry["sha256"])
+    temp = CHECKER.with_name(CHECKER.name + ".tmp")
+    with gzip.open(packed, "rb") as source, temp.open("wb") as out:
+        shutil.copyfileobj(source, out)
+    if sha256(temp) != entry["unpacked_sha256"]:
+        temp.unlink()
+        raise Fail("Проверочная утилита повреждена после распаковки.")
+    os.chmod(temp, 0o755)
+    os.replace(temp, CHECKER)
+    return CHECKER
+
+
+def console_progress(label: str):
+    shown = [-1]
+
+    def report(done: int, total: int) -> None:
+        percent = done * 100 // total if total else 0
+        if percent != shown[0]:
+            shown[0] = percent
+            print(f"\r  {label}: {percent}% ({done / 1024 ** 2:.0f} МБ)", end="", flush=True)
+    return report
+
+
+def package_path(release: dict) -> Path:
+    return CACHE_HOME / release["package"]["name"]
+
+
+# ------------------------------------------------------------- game mode UI
+
+class Ui:
+    """zenity dialogs that close by themselves: in Game Mode a gamepad cannot press GTK buttons."""
+
+    def __init__(self, enabled: bool = True):
+        has_display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+        self.zenity = shutil.which("zenity") if enabled and has_display else None
+
+    def _show(self, kind: str, text: str, timeout: int) -> None:
+        say(text)
+        if not self.zenity:
+            return
+        try:
+            subprocess.run([self.zenity, kind, "--title", UI_TITLE, "--width", "560", "--text", text,
+                            "--timeout", str(timeout)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=timeout + 15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def info(self, text: str, timeout: int = 5) -> None:
+        self._show("--info", text, timeout)
+
+    def warn(self, text: str, timeout: int = 12) -> None:
+        self._show("--warning", text, timeout)
+
+    @contextlib.contextmanager
+    def progress(self, text: str, pulsate: bool = True):
+        """Yields a report(done, total) callback; the dialog closes when the block ends."""
+        say(text)
+        process = None
+        if self.zenity:
+            try:
+                process = subprocess.Popen(
+                    [self.zenity, "--progress", "--title", UI_TITLE, "--width", "560", "--text", text, "--no-cancel",
+                     "--auto-close"] + (["--pulsate"] if pulsate else []),
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+            except OSError:
+                process = None
+        shown = [-1]
+
+        def report(done: int, total: int) -> None:
+            percent = min(99, done * 100 // total) if total else 0
+            if process and percent != shown[0]:
+                shown[0] = percent
+                with contextlib.suppress(OSError, ValueError):
+                    process.stdin.write(f"{percent}\n# {text} {done / 1024 ** 2:.0f} МБ\n")
+                    process.stdin.flush()
+        try:
+            yield report
+        finally:
+            if process:
+                with contextlib.suppress(OSError, ValueError):
+                    process.stdin.write("100\n")
+                    process.stdin.close()
+                with contextlib.suppress(subprocess.SubprocessError):
+                    process.wait(timeout=5)
+                if process.poll() is None:
+                    process.terminate()
+
+
+# -------------------------------------------------------- Steam launch options
+
+def vdf_tokens(text: str):
+    """(kind, value, start, end) for VDF strings and braces, skipping // comments."""
+    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"|([{}])|//[^\n]*', text):
+        if match.group(2):
+            yield match.group(2), match.group(2), match.start(), match.end()
+        elif match.group(1) is not None:
+            yield "str", match.group(1), match.start(1), match.end(1)
+
+
+def vdf_find_block(text: str, path: list[str]) -> tuple[int, int] | None:
+    """Span (after "{", at "}") of the block reached by path, keys compared case-insensitively."""
+    tokens = list(vdf_tokens(text))
+    depth_path: list[str] = []
+    key = None
+    for index, (kind, value, start, end) in enumerate(tokens):
+        if kind == "{":
+            depth_path.append(key or "")
+            key = None
+            if [part.lower() for part in depth_path] == [part.lower() for part in path]:
+                level = 1
+                for kind2, _, start2, _ in tokens[index + 1:]:
+                    level += kind2 == "{"
+                    level -= kind2 == "}"
+                    if level == 0:
+                        return end, start2
+                return None
+        elif kind == "}":
+            if depth_path:
+                depth_path.pop()
+            key = None
+        elif key is None:
+            key = value
+        else:
+            key = None
+    return None
+
+
+def vdf_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def vdf_unescape(value: str) -> str:
+    return value.replace('\\"', '"').replace("\\\\", "\\")
+
+
+APPS_PATH = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"]
+
+
+def launch_option_get(text: str) -> str | None:
+    block = vdf_find_block(text, APPS_PATH + [APP_ID])
+    if block is None:
+        return None
+    match = re.search(r'"LaunchOptions"\s+"((?:[^"\\]|\\.)*)"', text[block[0]:block[1]], re.IGNORECASE)
+    return vdf_unescape(match.group(1)) if match else None
+
+
+def launch_option_remove(text: str) -> str:
+    """Drop the game's LaunchOptions entry; drop the whole app block too if nothing else is left in it."""
+    block = vdf_find_block(text, APPS_PATH + [APP_ID])
+    if block is None:
+        return text
+    body = text[block[0]:block[1]]
+    match = re.search(r'\s*"LaunchOptions"\s+"(?:[^"\\]|\\.)*"', body, re.IGNORECASE)
+    if not match:
+        return text
+    body = body[:match.start()] + body[match.end():]
+    if body.strip():
+        return text[:block[0]] + body + text[block[1]:]
+    head = re.search(r'\s*"' + APP_ID + r'"\s*\{$', text[:block[0]])
+    close = text.index("}", block[1]) + 1
+    return text[:head.start()] + text[close:]
+
+
+def launch_option_set(text: str, value: str) -> str | None:
+    """Return text with the game's LaunchOptions set to value, or None if the apps block is missing."""
+    block = vdf_find_block(text, APPS_PATH + [APP_ID])
+    if block is not None:
+        body = text[block[0]:block[1]]
+        match = re.search(r'("LaunchOptions"\s+")((?:[^"\\]|\\.)*)(")', body, re.IGNORECASE)
+        if match:
+            start, end = block[0] + match.start(2), block[0] + match.end(2)
+            return text[:start] + vdf_escape(value) + text[end:]
+        return text[:block[0]] + f'\n\t\t\t\t\t\t"LaunchOptions"\t\t"{vdf_escape(value)}"' + text[block[0]:]
+    apps = vdf_find_block(text, APPS_PATH)
+    if apps is None:
+        return None
+    entry = f'\n\t\t\t\t\t"{APP_ID}"\n\t\t\t\t\t{{\n\t\t\t\t\t\t"LaunchOptions"\t\t"{vdf_escape(value)}"\n\t\t\t\t\t}}'
+    return text[:apps[0]] + entry + text[apps[0]:]
+
+
+def with_launcher(option: str) -> str:
+    if str(LAUNCHER) in option:
+        return option
+    if "%command%" in option:
+        return option.replace("%command%", f"{LAUNCHER} %command%", 1)
+    return f"{LAUNCHER} %command% {option}".strip()
+
+
+def without_launcher(option: str) -> str:
+    option = option.replace(f"{LAUNCHER} ", "").strip()
+    return "" if option == "%command%" else option
+
+
+def localconfigs() -> list[Path]:
+    found = []
+    for root in steam_roots():
+        found += [path for path in sorted(root.glob("userdata/*/config/localconfig.vdf")) if path.parts[-3] != "0"]
+    return found
+
+
+def launcher_configured() -> list[Path]:
+    result = []
+    for config in localconfigs():
+        with contextlib.suppress(OSError):
+            option = launch_option_get(config.read_text(encoding="utf-8", errors="surrogateescape"))
+            if option and str(LAUNCHER) in option:
+                result.append(config)
+    return result
+
+
+def process_running(name: str) -> bool:
+    for entry in proc_entries():
+        with contextlib.suppress(OSError):
+            if (entry / "comm").read_text().strip() == name:
+                return True
+    return False
+
+
+def stop_steam() -> bool:
+    """Shut Steam down so it does not overwrite localconfig.vdf; returns whether it was running."""
+    if not process_running("steam"):
+        return False
+    say("Steam закрывается, чтобы сохранить параметры запуска игры…")
+    with contextlib.suppress(OSError):
+        subprocess.run(["steam", "-shutdown"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+    for _ in range(90):
+        if not process_running("steam"):
+            time.sleep(2)
+            return True
+        time.sleep(1)
+    raise Fail("Steam не закрылся. Закройте Steam вручную и повторите команду.")
+
+
+def start_steam() -> None:
+    # In Game Mode gamescope-session restarts Steam by itself; in Desktop Mode we bring it back.
+    time.sleep(5)
+    if process_running("steam") or process_running("gamescope-session") or process_running("gamescope"):
+        return
+    with contextlib.suppress(OSError):
+        subprocess.Popen(["steam"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    say("Steam запущен снова.")
+
+
+def edit_launch_options(add: bool, previous: dict | None = None) -> dict:
+    """Add or remove the launcher in every Steam profile; returns {config path: previous value}."""
+    changes = {}
+    for config in localconfigs():
+        text = config.read_text(encoding="utf-8", errors="surrogateescape")
+        existing = launch_option_get(text)
+        current = existing or ""
+        if add:
+            value = with_launcher(current)
+        elif previous and str(config) in previous and str(LAUNCHER) in current:
+            value = previous[str(config)]
+        else:
+            value = without_launcher(current)
+        if value == existing or (value == current and existing is not None):
+            continue
+        updated = launch_option_remove(text) if value is None else launch_option_set(text, value)
+        if updated is None:
+            continue
+        backup = config.with_name(config.name + ".ru_voice_backup")
+        if not backup.exists():
+            shutil.copy2(config, backup)
+        temp = config.with_name(config.name + ".ru_voice_tmp")
+        temp.write_text(updated, encoding="utf-8", errors="surrogateescape")
+        os.replace(temp, config)
+        changes[str(config)] = existing
+    return changes
+
+
+# ---------------------------------------------------------- compatibility check
+
+def mod_fingerprint(game: Path, state: dict) -> str:
+    mod = game / "mods" / MOD_ID
+    parts = [sha256(mod / "src/mod.lua") if (mod / "src/mod.lua").is_file() else "-",
+             str(state.get("release", {}).get("revision", 0)),
+             sha256(CHECKER) if CHECKER.is_file() else "-"]
+    for dll in (RUNTIME_DLL, RUNTIME_DLL + DISABLED_SUFFIX):
+        if (game / dll).is_file():
+            parts.append(sha256(game / dll))
+    return "|".join(parts)
+
+
+def run_checker(game: Path) -> tuple[bool, int, str]:
+    """Run the Lua mod against the current game files without writing; (ok, maps, error tail)."""
+    try:
+        result = subprocess.run([str(CHECKER), "run", "--dry-run", "-g", str(game)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300,
+                                env=dict(os.environ, NO_COLOR="1"))
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout.decode("utf-8", "replace"))
+        code = result.returncode
+    except (OSError, subprocess.SubprocessError) as error:
+        return False, 0, str(error)
+    maps = output.count("RU_VOICE_MAP ")
+    errors = [line.strip() for line in output.splitlines() if "ERROR" in line or "Error" in line]
+    return code == 0 and not errors, maps, " ".join(errors)[-600:] or output[-600:]
+
+
+def validate(game: Path, state: dict, ui: Ui | None = None, force: bool = False) -> dict:
+    """Signatures plus a dry run of the Lua mod; cached until the game or the mod changes."""
+    exe = game / "enshrouded.exe"
+    try:
+        version = version_from_index(game / "enshrouded.kfc")
+    except Fail as error:
+        version = f"? ({error})"
+    info = exe.stat()
+    key = f"{version}|{info.st_size}|{info.st_mtime_ns}|{mod_fingerprint(game, state)}"
+    cached = state.get("validated")
+    if cached and cached.get("key") == key and not force:
+        return cached
+    build = version.split("|")[0]
+    result = {"key": key, "build": build, "ok": True, "reason": "", "maps": None,
+              "at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    try:
+        check_signatures(exe)
+    except Fail as error:
+        result.update(ok=False, reason=str(error))
+    if result["ok"] and CHECKER.is_file():
+        expected = state.get("release", {}).get("maps", EXPECTED_MAPS)
+        with (ui.progress("Проверяю русскую озвучку для этой версии игры…") if ui else contextlib.nullcontext()):
+            ok, maps, details = run_checker(game)
+        result["maps"] = maps
+        if not ok or maps != expected:
+            result.update(ok=False, reason=f"мод подключил {maps} из {expected} записей. {details}".strip())
+    log(game, f"Compatibility check: build {build} ok={result['ok']} {result['reason']}")
+    state["validated"] = result
+    save_state(game, state)
+    return result
+
+
+def set_enabled(game: Path, state: dict, enabled: bool) -> bool:
+    """Toggle the mod by renaming our dbghelp.dll; without it the game starts unmodded. Returns whether it changed."""
+    active, parked = game / RUNTIME_DLL, game / (RUNTIME_DLL + DISABLED_SUFFIX)
+    changed = False
+    if enabled and parked.is_file() and not active.exists():
+        os.replace(parked, active)
+        changed = True
+    elif not enabled and active.is_file() and sha256(active) == state.get("owned_dlls", {}).get(RUNTIME_DLL):
+        os.replace(active, parked)
+        changed = True
+    disabled = None if enabled else state.get("validated", {}).get("build", "?")
+    if state.get("disabled") != disabled:
+        state["disabled"] = disabled
+        save_state(game, state)
+    return changed
+
+
+# ------------------------------------------------------------- release updates
+
+def replace_owned_file(game: Path, state: dict, name: str, source: Path, digest: str) -> None:
+    """Swap an owned DLL in place, keeping the disabled name if the mod is parked."""
+    target = game / name
+    if name == RUNTIME_DLL and not target.exists() and (game / (name + DISABLED_SUFFIX)).exists():
+        target = game / (name + DISABLED_SUFFIX)
+    temp = target.with_name(target.name + ".ru_voice_tmp")
+    shutil.copyfile(source, temp)
+    if sha256(temp) != digest:
+        temp.unlink()
+        raise Fail(f"Не удалось обновить {name}.")
+    os.replace(temp, target)
+    state["owned_dlls"][name] = digest
+
+
+def replace_package(game: Path, state: dict, release: dict, zip_path: Path) -> None:
+    """Install a new upstream package over the current mod folder; EML re-embeds it at the next launch."""
+    package = Package(zip_path)
+    files = package.manifest(release["package"].get("files", EXPECTED_PAYLOAD_FILES))
+    staging = game / STATE_DIR / "staging"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        extract_verified(package, files, staging)
+        mod, old = game / "mods" / MOD_ID, game / STATE_DIR / "previous_mod"
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(mod, old)
+        os.replace(staging / "mod", mod)
+        shutil.rmtree(old, ignore_errors=True)
+        eml_hash = files["native/dbghelp.dll"].lower()
+        if state["owned_dlls"].get(EML_DLL) != eml_hash:
+            replace_owned_file(game, state, EML_DLL, staging / "native/dbghelp.dll", eml_hash)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    state["overlay"] = {}
+
+
+def apply_overlay(game: Path, state: dict, release: dict) -> None:
+    """Fork-side fixes on top of the author's package, e.g. an adapted src/mod.lua after a game patch."""
+    mod = game / "mods" / MOD_ID
+    wanted = release.get("overlay", {})
+    for rel in sorted(set(state.get("overlay", {})) - set(wanted)):
+        check_rel(rel)
+        package = Package(download(release["package"]["url"], package_path(release), release["package"]["sha256"]))
+        with package.open("mod/" + rel) as source, (mod / rel).open("wb") as out:
+            shutil.copyfileobj(source, out)
+    for rel, entry in sorted(wanted.items()):
+        check_rel(rel)
+        if (mod / rel).is_file() and sha256(mod / rel) == entry["sha256"]:
+            continue
+        cached = download(component_url(entry), TOOL_HOME / "overlay" / rel, entry["sha256"])
+        (mod / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(cached, mod / rel)
+    state["overlay"] = {rel: entry["sha256"] for rel, entry in wanted.items()}
+    state["mod_files"] = sum(1 for path in mod.rglob("*") if path.is_file())
+
+
+def apply_release(game: Path, state: dict, release: dict, ui: Ui) -> None:
+    current = state.setdefault("release", {})
+    new_package = current.get("package", release["package"]["sha256"]) != release["package"]["sha256"]
+    if new_package:
+        with ui.progress("Скачиваю обновление русской озвучки…", pulsate=False) as report:
+            download(release["package"]["url"], package_path(release), release["package"]["sha256"], report)
+    runtime = download(component_url(release["runtime"]), TOOL_HOME / RUNTIME_DLL, release["runtime"]["sha256"])
+    ensure_checker(release.get("checker"))
+    if new_package:
+        replace_package(game, state, release, package_path(release))
+    if state["owned_dlls"].get(RUNTIME_DLL) != release["runtime"]["sha256"]:
+        replace_owned_file(game, state, RUNTIME_DLL, runtime, release["runtime"]["sha256"])
+    apply_overlay(game, state, release)
+    state["release"] = {"revision": release["revision"], "package": release["package"]["sha256"],
+                        "maps": release.get("maps", EXPECTED_MAPS), "name": release.get("name", "")}
+    state.pop("validated", None)
+    save_state(game, state)
+    log(game, f"Updated to release {release['revision']} {release.get('name', '')}")
+
+
+def self_update(release: dict) -> bool:
+    """Replace the installed tool with the release's one; returns True if it changed."""
+    if TOOL.is_file() and sha256(TOOL) == release["tool"]["sha256"]:
+        return False
+    download(component_url(release["tool"]), TOOL, release["tool"]["sha256"])
+    return True
+
+
+def setup_autoupdate(game: Path, state: dict) -> None:
+    TOOL_HOME.mkdir(parents=True, exist_ok=True)
+    me = Path(sys.argv[0]).resolve()
+    if me != TOOL.resolve() and me.is_file():
+        shutil.copy2(me, TOOL)
+    LAUNCHER.write_text(LAUNCHER_SCRIPT, encoding="utf-8")
+    os.chmod(LAUNCHER, 0o755)
+    if launcher_configured():
+        state.setdefault("launch_options", {})
+        save_state(game, state)
+        return
+    was_running = stop_steam()
+    try:
+        changes = edit_launch_options(add=True)
+    finally:
+        if was_running:
+            start_steam()
+    if not launcher_configured():
+        raise Fail("Не удалось прописать параметры запуска Enshrouded в Steam. Откройте свойства игры в Steam один раз "
+                   "и повторите команду, либо впишите вручную в «Параметры запуска»:  " + f"{LAUNCHER} %command%")
+    previous = state.get("launch_options") or {}
+    previous.update({path: value for path, value in changes.items() if path not in previous})
+    state["launch_options"] = previous
+    save_state(game, state)
+    log(game, "Autoupdate launcher set in Steam launch options: " + (", ".join(changes) or "already present"))
+
+
 # ------------------------------------------------------------------- commands
 
 def state_path(game: Path) -> Path:
@@ -646,7 +1195,86 @@ def migrate_layout(game: Path, library: Path | None, state: dict, runtime_dll: P
     state["layout_at"] = time.time()
     save_state(game, state)
     log(game, "OK linux layout migration to dbghelp chain")
-    say("Готово. Запустите игру: русская озвучка включится сама. Потом проверьте:  " + COMMAND_HINT + " status")
+    say("Установка переведена на dbghelp.dll.")
+
+
+INCOMPATIBLE_TEXT = ("Русская озвучка временно отключена.\n\n"
+                     "Enshrouded обновилась (сборка {build}), и мод ещё не адаптирован под эту версию. "
+                     "Игра запустится без русской озвучки.\n\n"
+                     "Когда выйдет исправление, оно установится само при следующем запуске игры.")
+
+
+def update_installed(game: Path, state: dict, release: dict | None) -> None:
+    """Re-running install on an existing install: apply the latest release and enable autoupdate."""
+    if release is None:
+        raise Fail("Мод уже установлен, а GitHub недоступен. Проверка: status. Переустановка: uninstall, затем install.")
+    if state.get("release", {}).get("revision") != release["revision"]:
+        say(f"Обновляю русскую озвучку до ревизии {release['revision']}…")
+        apply_release(game, state, release, Ui(enabled=False))
+    else:
+        say(f"Установлена актуальная версия мода (ревизия {release['revision']}).")
+    ensure_checker(release.get("checker"))
+    if CHECKER.is_file():
+        say("Проверка совместимости мода с этой сборкой игры (EML без записи файлов)…")
+    result = validate(game, state)
+    set_enabled(game, state, result["ok"])
+    if not result["ok"]:
+        say("  НЕ совместим, мод отключён до исправления: " + result["reason"])
+    elif result["maps"] is not None:
+        say(f"  Совместим: подключено {result['maps']} записей.")
+    setup_autoupdate(game, state)
+    say("Автообновление включено: при каждом запуске игры мод сам проверяет обновления и совместимость.")
+
+
+def cmd_launch(args) -> None:
+    """Called by launch.sh before the game; launch.sh starts the game itself, exactly once, afterwards."""
+    try:
+        launch_prepare()
+    except BaseException as error:  # never fail loudly: the game starts anyway
+        with contextlib.suppress(BaseException):
+            log(find_game(None)[0], f"Launch check failed: {error!r}")
+
+
+def refresh_launcher() -> None:
+    """Rewrite an outdated launch.sh via rename: a running bash keeps reading the old inode."""
+    if LAUNCHER.is_file() and LAUNCHER.read_text(encoding="utf-8") != LAUNCHER_SCRIPT:
+        temp = LAUNCHER.with_name(LAUNCHER.name + ".tmp")
+        temp.write_text(LAUNCHER_SCRIPT, encoding="utf-8")
+        os.chmod(temp, 0o755)
+        os.replace(temp, LAUNCHER)
+
+
+def launch_prepare() -> None:
+    game, _ = find_game(None)
+    state = read_state(game)
+    if not state or state.get("status") != "installed":
+        return
+    ui = Ui()
+    release = fetch_release(timeout=5)
+    updated = False
+    if release:
+        if os.environ.get("RU_VOICE_REEXEC") != "1" and self_update(release):
+            log(game, "Installer updated itself; re-running the launch check")
+            os.execve(sys.executable, [sys.executable, str(TOOL), "launch"], dict(os.environ, RU_VOICE_REEXEC="1"))
+        refresh_launcher()
+        if state.get("release", {}).get("revision") != release["revision"]:
+            try:
+                apply_release(game, state, release, ui)
+                updated = True
+            except Exception as error:
+                log(game, f"Update failed: {error!r}")
+                ui.warn(f"Не удалось обновить русскую озвучку: {error}\n\nИгра запустится с прежней версией мода.", 8)
+    was_disabled = bool(state.get("disabled"))
+    result = validate(game, state, ui)
+    set_enabled(game, state, result["ok"])
+    log(game, f"Launch: release {state.get('release', {}).get('revision')} build {result['build']} "
+              + ("enabled" if result["ok"] else "disabled: " + result["reason"]))
+    if not result["ok"]:
+        ui.warn(INCOMPATIBLE_TEXT.format(build=result["build"]), 12)
+    elif updated:
+        ui.info("Русская озвучка обновлена и проверена с этой версией игры.", 5)
+    elif was_disabled:
+        ui.info("Русская озвучка снова включена: мод совместим с этой версией игры.", 5)
 
 
 def cmd_install(args) -> None:
@@ -658,13 +1286,17 @@ def cmd_install(args) -> None:
     ensure_closed()
     version = check_game(game)
     say(f"Версия игры: {version.split('|')[0]} — поддерживается, аудиофункции найдены однозначно.")
-    runtime_dll = find_runtime_dll(args.runtime_dll)
+    release = None if args.source else fetch_release()
+    if release is None and not args.source:
+        say("GitHub недоступен: ищу архив мода и runtime-DLL локально.")
+    runtime_dll = (download(component_url(release["runtime"]), TOOL_HOME / RUNTIME_DLL, release["runtime"]["sha256"])
+                   if release else find_runtime_dll(args.runtime_dll))
     state = read_state(game)
     if state and state.get("status") == "installed":
         if state.get("layout", 1) < LAYOUT:
             migrate_layout(game, library, state, runtime_dll)
-            return
-        raise Fail("Мод уже установлен этим скриптом. Проверка: status. Переустановка: uninstall, затем install.")
+        update_installed(game, state, release)
+        return
     mods = game / "mods"
     if (mods / LEGACY_MOD_ID).exists():
         raise Fail(f"Найдена старая версия mods/{LEGACY_MOD_ID}. Удалите её перед установкой.")
@@ -677,10 +1309,17 @@ def cmd_install(args) -> None:
         if version_from_index(eml_backup) == version:
             raise Fail("Индекс игры уже изменён другим модом EML. Установка остановлена, чтобы не испортить резервную копию.")
 
-    source = find_package(args.source)
+    if release:
+        say(f"Загрузка архива мода ({release['package']['name']}, около 570 МБ; уже скачанный не перекачивается)…")
+        source = download(release["package"]["url"], package_path(release), release["package"]["sha256"],
+                          console_progress("архив"))
+        say()
+        ensure_checker(release.get("checker"))
+    else:
+        source = find_package(args.source)
     say(f"Пакет мода: {source}")
     package = Package(source)
-    files = package.manifest()
+    files = package.manifest(release["package"].get("files", EXPECTED_PAYLOAD_FILES) if release else EXPECTED_PAYLOAD_FILES)
     dll_hashes = {RUNTIME_DLL: sha256(runtime_dll), EML_DLL: files["native/dbghelp.dll"].lower()}
     for dll, digest in dll_hashes.items():
         target = game / dll
@@ -741,7 +1380,18 @@ def cmd_install(args) -> None:
         state["autostart"] = True
         state["layout"] = LAYOUT
         state["layout_at"] = time.time()
+        if release:
+            state["release"] = {"revision": release["revision"], "package": release["package"]["sha256"],
+                                "maps": release.get("maps", EXPECTED_MAPS), "name": release.get("name", "")}
+            apply_overlay(game, state, release)
         save_state(game, state)
+
+        if CHECKER.is_file():
+            say("Проверка совместимости мода с этой сборкой игры (EML без записи файлов)…")
+            result = validate(game, state)
+            if not result["ok"]:
+                raise Fail("Мод несовместим с текущей сборкой игры, установка отменена: " + result["reason"])
+            say(f"  Совместим: подключено {result['maps']} записей.")
 
         state["overrides"] = apply_overrides(game, library, state_dir)
         state["status"] = "installed"
@@ -758,6 +1408,10 @@ def cmd_install(args) -> None:
             reg_revert(Path(state["overrides"]["user_reg"]), state["overrides"]["previous"])
         if not state["preexisting"][AUTOSTART_MARKER] and (game / AUTOSTART_MARKER).is_file():
             (game / AUTOSTART_MARKER).unlink()
+        bak = game / "enshrouded.kfc.bak"
+        if (not state["preexisting"]["enshrouded.kfc.bak"] and bak.is_file()
+                and state["original"].get("enshrouded.kfc") == sha256(bak)):
+            bak.unlink()
         shutil.rmtree(staging, ignore_errors=True)
         if created_state_dir:
             shutil.rmtree(state_dir, ignore_errors=True)
@@ -771,6 +1425,12 @@ def cmd_install(args) -> None:
 
     say()
     say("Готово: файлы русской озвучки установлены (525 страниц дневника и 593 реплики NPC).")
+    if release:
+        try:
+            setup_autoupdate(game, state)
+            say("Автообновление включено: при каждом запуске игры мод сам проверяет обновления и совместимость.")
+        except Fail as error:
+            say(f"Автообновление не включено: {error}")
     if state["overrides"] is None:
         say()
         say("ВНИМАНИЕ: префикс Proton для Enshrouded ещё не создан, поэтому DLL overrides не записаны.")
@@ -852,13 +1512,34 @@ def cmd_status(args) -> None:
         problems.append(f"Установка старой версии (через winmm.dll, Proton её не загружает). Обновите: {COMMAND_HINT} install")
     legacy = bool(state) and state.get("status") == "installed" and state.get("layout", 1) < LAYOUT
     loaders = (RUNTIME_DLL,) if legacy else (RUNTIME_DLL, EML_DLL)
+
+    def present(dll: str) -> bool:
+        return (game / dll).is_file() or (dll == RUNTIME_DLL and (game / (dll + DISABLED_SUFFIX)).is_file())
     for dll in loaders:
-        if not (game / dll).is_file():
+        if not present(dll):
             problems.append(f"Нет {dll} в папке игры.")
-    say("DLL загрузчиков: " + ("OK" if all((game / dll).is_file() for dll in loaders) else "НЕ ВСЕ"))
+    say("DLL загрузчиков: " + ("OK" if all(present(dll) for dll in loaders) else "НЕ ВСЕ"))
     say("Автовключение озвучки при запуске: " + ("да" if (game / AUTOSTART_MARKER).is_file() else "нет (переключение по F3)"))
     ok, where = overrides_status(library)
     say(f"DLL overrides для Proton: {'OK, ' if ok else 'НЕТ — '}{where}")
+    if state and state.get("status") == "installed":
+        configured = launcher_configured()
+        say("Автообновление при запуске игры: " + ("включено" if configured else "не настроено"))
+        if not configured:
+            problems.append(f"Автообновление не настроено. Выполните:  {COMMAND_HINT} install")
+        remote = fetch_release(timeout=5)
+        installed = state.get("release", {}).get("revision", "—")
+        say(f"Версия мода: ревизия {installed}"
+            + (f", на GitHub: {remote['revision']}" if remote else ", GitHub сейчас недоступен"))
+        if remote and installed != remote["revision"] and configured:
+            say("  Обновление установится само при следующем запуске игры.")
+        checked = state.get("validated")
+        if checked:
+            say(f"Проверка совместимости ({checked['at'][:16].replace('T', ' ')}, сборка {checked['build']}): "
+                + ("пройдена" if checked["ok"] else "НЕ пройдена — " + checked["reason"]))
+        if state.get("disabled"):
+            problems.append(f"Мод временно отключён: сборка игры {state['disabled']} с ним несовместима. "
+                            "Исправление установится само при запуске игры, когда выйдет.")
     if not ok:
         problems.append(f"Без DLL overrides Proton не загрузит мод. Выполните: {COMMAND_HINT} overrides "
                         f"(после первого запуска игры) или задайте параметры запуска: {LAUNCH_OPTIONS}")
@@ -951,6 +1632,18 @@ def cmd_uninstall(args) -> None:
         if same_build and sha256(backup / name) != state["original"][name]:
             raise Fail("Резервная копия повреждена: " + name)
 
+    parked = game / (RUNTIME_DLL + DISABLED_SUFFIX)
+    if parked.is_file() and not (game / RUNTIME_DLL).exists():
+        os.replace(parked, game / RUNTIME_DLL)
+    if state.get("launch_options") is not None or launcher_configured():
+        was_running = stop_steam()
+        try:
+            edit_launch_options(add=False, previous=state.get("launch_options"))
+        finally:
+            if was_running:
+                start_steam()
+        say("Автообновление отключено: параметр запуска Enshrouded в Steam восстановлен.")
+
     mod = game / "mods" / MOD_ID
     if mod.is_symlink():
         raise Fail(f"mods/{MOD_ID} является ссылкой; удалите её вручную.")
@@ -1002,6 +1695,9 @@ def cmd_uninstall(args) -> None:
         save_state(game, state)
     else:
         shutil.rmtree(state_dir)
+    # The installer itself lives in TOOL_HOME; the one-liner downloads it again when needed.
+    shutil.rmtree(CACHE_HOME, ignore_errors=True)
+    shutil.rmtree(TOOL_HOME, ignore_errors=True)
     log(game, "OK linux uninstall")
     say("Русская озвучка удалена.")
 
@@ -1019,6 +1715,8 @@ def main() -> int:
     sub.add_parser("overrides", help="записать DLL overrides в префикс Proton")
     for child in sub.choices.values():
         child.add_argument("--game", dest="game_sub", help="папка Enshrouded")
+    launch = sub.add_parser("launch", help="(параметр запуска Steam) проверить обновления и запустить игру")
+    launch.add_argument("game_command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     args.game = getattr(args, "game_sub", None) or args.game
     command = args.command or "install"
@@ -1026,7 +1724,8 @@ def main() -> int:
         args.source = None
         args.runtime_dll = None
     try:
-        {"install": cmd_install, "status": cmd_status, "uninstall": cmd_uninstall, "overrides": cmd_overrides}[command](args)
+        {"install": cmd_install, "status": cmd_status, "uninstall": cmd_uninstall, "overrides": cmd_overrides,
+         "launch": cmd_launch}[command](args)
     except Fail as error:
         say()
         say(f"ОШИБКА: {error}")
