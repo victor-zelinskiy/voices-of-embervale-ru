@@ -888,15 +888,35 @@ def stop_steam() -> bool:
     raise Fail("Steam не закрылся. Закройте Steam вручную и повторите команду.")
 
 
+def game_mode() -> bool:
+    for entry in proc_entries():
+        with contextlib.suppress(OSError):
+            if (entry / "comm").read_text().startswith("gamescope"):
+                return True
+    return False
+
+
 def start_steam() -> None:
-    # In Game Mode gamescope-session restarts Steam by itself; in Desktop Mode we bring it back.
-    time.sleep(5)
-    if process_running("steam") or process_running("gamescope-session") or process_running("gamescope"):
+    """Bring Steam back after stop_steam(); works from Konsole and over ssh."""
+    time.sleep(3)
+    if process_running("steam"):
         return
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    # SteamOS Game Mode runs Steam as steam-launcher.service (Restart=no) inside the gamescope session.
+    if game_mode() and shutil.which("systemctl"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if subprocess.run(["systemctl", "--user", "start", "steam-launcher.service"], timeout=60, **quiet).returncode == 0:
+                say("Steam запущен снова (игровой режим).")
+                return
+    # Desktop: systemd-run gives Steam the graphical session environment even without DISPLAY here.
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        if shutil.which("systemd-run") and subprocess.run(
+                ["systemd-run", "--user", "--collect", "--quiet", "steam"], timeout=30, **quiet).returncode == 0:
+            say("Steam запущен снова.")
+            return
     with contextlib.suppress(OSError):
-        subprocess.Popen(["steam"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    say("Steam запущен снова.")
+        subprocess.Popen(["steam"], start_new_session=True, **quiet)
+        say("Steam запущен снова.")
 
 
 def edit_launch_options(add: bool, previous: dict | None = None) -> dict:
