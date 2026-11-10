@@ -28,7 +28,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-APP_ID = "1203220"
+APP_ID = "1203620"
 MOD_ID = "ru_voice_separate_525"
 LEGACY_MOD_ID = "ru_voice_separate_520"
 DLLS = ("dbghelp.dll", "winmm.dll", "shroudtopia.dll")
