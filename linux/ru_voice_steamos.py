@@ -877,9 +877,17 @@ def stop_steam() -> bool:
     if not process_running("steam"):
         return False
     say("Steam закрывается, чтобы сохранить параметры запуска игры…")
-    with contextlib.suppress(OSError):
-        subprocess.run(["steam", "-shutdown"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=30)
+    quiet = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    # Game Mode: stopping steam-launcher.service sends Steam SIGTERM, a clean shutdown that saves its config;
+    # "steam -shutdown" is not delivered there when run from ssh.
+    stopped = False
+    if game_mode() and shutil.which("systemctl"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            stopped = subprocess.run(["systemctl", "--user", "stop", "steam-launcher.service"],
+                                     timeout=120, **quiet).returncode == 0
+    if not stopped:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["steam", "-shutdown"], timeout=30, **quiet)
     for _ in range(90):
         if not process_running("steam"):
             time.sleep(2)
