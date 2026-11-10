@@ -697,16 +697,20 @@ def host_env() -> dict:
     env["PATH"] = os.environ.get("SYSTEM_PATH") or "/usr/local/bin:/usr/bin"
     if "/bin" not in env["PATH"].split(":"):
         env["PATH"] += ":/bin"
+    # Game launches get no UTF-8 locale; GLib then rejects Cyrillic zenity arguments ("This option is not available").
+    locale = (env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or "").lower()
+    if "utf-8" not in locale and "utf8" not in locale:
+        env["LC_ALL"] = "C.UTF-8"
     return env
 
 
 def reaper_prefix(command: list[str]) -> list[str]:
-    """The game command line up to `reaper SteamLaunch AppId=N --` (Steam puts steam-launch-wrapper in
-    front of it). gamescope assigns a window to the game, and shows it in Game Mode, by finding this
-    reaper among the window process' ancestors."""
+    """`reaper SteamLaunch AppId=N --` from the game command line (Steam puts steam-launch-wrapper in
+    front of it; that one is left out so Steam does not track the dialog as the game). gamescope assigns
+    a window to the game, and shows it in Game Mode, by finding this reaper among its ancestors."""
     for index, part in enumerate(command):
         if part.endswith("/reaper") and "--" in command[index:]:
-            return command[:command.index("--", index) + 1]
+            return command[index:command.index("--", index) + 1]
     return []
 
 
