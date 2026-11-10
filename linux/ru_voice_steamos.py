@@ -27,7 +27,7 @@ import struct
 import sys
 import time
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 APP_ID = "1203620"
@@ -790,17 +790,36 @@ def cmd_install(args) -> None:
     say(f"  3. После первого запуска выйдите из игры и проверьте:  {COMMAND_HINT} status")
 
 
+def log_time(line: str) -> str:
+    match = re.search(r'"timestamp":"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)', line)
+    if not match:
+        return "?"
+    moment = datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    return moment.astimezone().strftime("%d.%m %H:%M")
+
+
 def eml_summary(game: Path) -> dict | None:
+    """Split EML logs (one file per day) into game launches.
+
+    EML runs the Lua mod only when game or mod files changed; an unchanged launch logs
+    "No changes detected, skipping patching" and no RU_VOICE_MAP lines, which is healthy.
+    """
     logs = sorted((game / "logs").glob("*eml.log"), key=lambda p: p.stat().st_mtime)
-    if not logs:
+    runs: list[dict] = []
+    for path in logs:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "Running lua with options" in line:
+                runs.append({"time": log_time(line), "maps": 0, "errors": [], "skipped": False})
+            elif runs:
+                run = runs[-1]
+                run["maps"] += "RU_VOICE_MAP " in line
+                run["skipped"] |= "No changes detected, skipping patching" in line
+                if '"level":"ERROR"' in line or "Error running mod loader" in line:
+                    run["errors"].append(line)
+    if not runs:
         return None
-    lines = logs[-1].read_text(encoding="utf-8", errors="replace").splitlines()
-    starts = [i for i, line in enumerate(lines) if "Running lua with options" in line]
-    run = lines[starts[-1]:] if starts else lines
-    errors = [line for line in run if '"level":"ERROR"' in line or "Error running mod loader" in line]
-    version = next((line for line in run if "RU_VOICE_GAME_VERSION" in line), None)
-    return {"file": logs[-1], "maps": sum("RU_VOICE_MAP " in line for line in run),
-            "errors": errors, "version": version is not None}
+    applied = next((run for run in reversed(runs) if run["maps"]), None)
+    return {"file": logs[-1], "last": runs[-1], "applied": applied, "launches": len(runs)}
 
 
 def cmd_status(args) -> None:
@@ -850,12 +869,25 @@ def cmd_status(args) -> None:
         if ok and mod.is_dir():
             problems.append("Запустите игру один раз и снова выполните status.")
     else:
-        say(f"Журнал EML ({summary['file'].name}): подключено записей {summary['maps']} из {EXPECTED_MAPS}"
-            + (f", ошибок {len(summary['errors'])}" if summary["errors"] else ""))
-        for line in summary["errors"][-3:]:
-            say("  " + line[:400])
-        if summary["maps"] != EXPECTED_MAPS:
-            problems.append("EML подключил не все записи. Приложите logs/*eml.log автору мода.")
+        last, applied = summary["last"], summary["applied"]
+        if last["errors"]:
+            say(f"Журнал EML: последний запуск ({last['time']}) завершился с ошибками ({len(last['errors'])}):")
+            for line in last["errors"][-3:]:
+                say("  " + line[:400])
+            problems.append("EML не смог подключить озвучку. Пришлите вывод status и logs/*eml.log.")
+        elif last["maps"]:
+            say(f"Журнал EML: последний запуск ({last['time']}) подключил записей {last['maps']} из {EXPECTED_MAPS}")
+            if last["maps"] != EXPECTED_MAPS:
+                problems.append("EML подключил не все записи. Пришлите вывод status и logs/*eml.log.")
+        elif last["skipped"]:
+            embedded = (f"встроена {applied['time']}: {applied['maps']} из {EXPECTED_MAPS} записей"
+                        if applied else "встроена раньше, тот журнал уже удалён")
+            say(f"Журнал EML: индекс актуален, последний запуск ({last['time']}) без изменений; озвучка {embedded}")
+            if applied and applied["maps"] != EXPECTED_MAPS:
+                problems.append("При встраивании EML подключил не все записи. Пришлите вывод status и logs/*eml.log.")
+        else:
+            say(f"Журнал EML: последний запуск ({last['time']}) не дошёл до мода озвучки.")
+            problems.append("EML запустился, но мод озвучки не выполнился. Пришлите вывод status и logs/*eml.log.")
     runtime = game / "ru_voice_runtime.log"
     if runtime.is_file():
         tail = runtime.read_text(encoding="utf-8", errors="replace").splitlines()[-6:]
